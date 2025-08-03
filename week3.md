@@ -11,15 +11,15 @@ go to altium and select add new library
 now, i want to test my new library
 <img width="514" height="805" alt="image" src="https://github.com/user-attachments/assets/7a992977-6da9-41ee-84cd-67fde24507a4" />
 
-một vài kiến thức mới:
-Cách thêm, tìm thư viện
-cách update schematic to pcd design từ nút design ở schematic
-Lúc sx linh kiện thì sx theo nhóm chức năng ở schematic
-đi dây tự động, điều chỉnh kích thước mạch bằng design -> board shape
-căn trái a l , phải a r, trên a t, dưới a b
-lớp keep out layer dùng để cắt, lớp top over relay để vẽ text, lớp bot, top đặt linh kiện
-mẫu thông tin mạch:
-tên mạch version mạch
-người vẽ
-ngày vẽ
-email liên hệ/sddt
+một vài kiến thức mới:   
+Cách thêm, tìm thư viện   
+cách update schematic to pcd design từ nút design ở schematic   
+Lúc sx linh kiện thì sx theo nhóm chức năng ở schematic   
+đi dây tự động, điều chỉnh kích thước mạch bằng design -> board shape  
+căn trái a l , phải a r, trên a t, dưới a b   
+lớp keep out layer dùng để cắt, lớp top over relay để vẽ text, lớp bot, top đặt linh kiện  
+mẫu thông tin mạch:  
+tên mạch version mạch  
+người vẽ  
+ngày vẽ  
+email liên hệ/sddt  
