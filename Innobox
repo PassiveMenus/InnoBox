@@ -1,0 +1,269 @@
+// -------------------- Library ------------------------
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <TinyGPS++.h>
+#include <WiFi.h>
+
+// ------------------ Pin Definitions ------------------
+#define SPEAKER_PIN 23
+#define I2C_SCL 22
+#define I2C_SDA 21
+#define LIGHT_SENSOR 35
+#define HC_SENSOR 33
+#define DOOR_SENSOR 26
+#define SWITCH_PIN 27 
+#define GPS_BAUD 9600
+#define GPS_RX 16
+#define GPS_TX 17
+
+// ------------------ Timing Config ------------------
+unsigned long lcdRefreshInterval = 500;
+const unsigned long pageSwitchInterval = 1500;
+const unsigned long iconRefreshInterval = 500;
+const unsigned long doorSerialInterval = 250;
+const unsigned long bmeSerialInterval = 500;
+const unsigned long gpsSerialInterval = 500;
+
+// ------------------ WiFi Config ------------------
+const char* ssid = "BKSTAR_T2_02";
+const char* password = "stemstar";
+
+// ------------------ Objects ------------------
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+Adafruit_BME280 bme;
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+
+// ------------------ State Variables ------------------
+bool Wifi_stat = false;
+bool doorState = false;
+bool hasError = false;
+int lcdPage = 0;
+
+unsigned long prevLCD = 0;
+unsigned long prevPage = 0;
+unsigned long prevIcon = 0;
+unsigned long prevDoorSerial = 0;
+unsigned long prevBMESerial = 0;
+unsigned long prevGPSSerial = 0;
+
+// ------------------ Custom Icons ------------------
+byte iconDB[8]       = {B11000,B10100,B10100,B11010,B00101,B00110,B00101,B00110}; // database
+byte iconHeat[8]     = {B00000,B00100,B00100,B01010,B01010,B10001,B01110,B00000};
+byte iconBuzz[8]     = {B00100,B01010,B01010,B10001,B10001,B01010,B00100,B00000};
+byte iconLight[8]    = {B00100,B01010,B10001,B10001,B01010,B00100,B00000,B00000};
+byte iconDoor[8]     = {B00000,B11111,B10101,B11111,B10101,B11111,B11111,B11111};
+byte iconWifi[8]     = {B00000,B00000,B00000,B11100,B00010,B11001,B00101,B10101};
+byte iconHumidity[8] = {B01000,B10100,B10100,B01010,B00101,B00001,B00010,B00111};
+byte iconHuman[8]    = {B00100,B01110,B00101,B00111,B01100,B10110,B00101,B01001};
+
+// ------------------ Setup ------------------
+void setup() {
+  Serial.begin(115200);
+  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
+  Wire.begin(I2C_SDA, I2C_SCL);
+  pinMode(DOOR_SENSOR, INPUT_PULLUP);
+  pinMode(LIGHT_SENSOR, INPUT);
+  pinMode(SPEAKER_PIN, OUTPUT);
+  digitalWrite(SPEAKER_PIN,1);
+  lcd.init();
+  lcd.backlight();
+
+  lcd.createChar(0, iconDB);
+  lcd.createChar(1, iconHeat);
+  lcd.createChar(2, iconBuzz);
+  lcd.createChar(3, iconLight);
+  lcd.createChar(4, iconDoor);
+  lcd.createChar(5, iconWifi);
+  lcd.createChar(6, iconHumidity);
+  lcd.createChar(7, iconHuman);
+ 
+  lcd.setCursor(0, 1);
+  lcd.print("Connecting WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
+    Serial.print(".");
+    lcd.print(".");
+    delay(500);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    Wifi_stat = true;
+  } else {
+    Serial.println("\nWiFi connection failed");
+    Wifi_stat = false;
+    hasError = true;
+  }
+
+  // tone(SPEAKER_PIN,0,0);
+  if (!bme.begin(0x76)) {
+    Serial.println("Error: BME280 not found!");
+    lcd.clear();
+    lcd.setCursor(0, 1);
+    lcd.print("BME280 error!");
+    digitalWrite(SPEAKER_PIN,0);
+    hasError = true;
+  }
+
+  delay(1000);
+  lcd.clear();
+}
+
+// ------------------ Loop ------------------
+void loop() {
+  unsigned long now = millis();
+  doorState = digitalRead(DOOR_SENSOR);
+  while (gpsSerial.available() > 0) gps.encode(gpsSerial.read());
+
+  // Slow down refresh if error occurred
+  unsigned long lcdRate = hasError ? lcdRefreshInterval : lcdRefreshInterval;
+
+  // ----- LCD UPDATE -----
+  if (now - prevLCD >= lcdRate) {
+    prevLCD = now;
+    lcd.clear();
+
+    if (lcdPage == 0) displayGPS();
+    else displayBME();
+
+    displayIcons();
+  }
+
+  // ----- PAGE SWITCH -----
+  if (now - prevPage >= pageSwitchInterval) {
+    prevPage = now;
+    lcdPage = (lcdPage + 1) % 2;
+  }
+
+  // ----- SERIAL OUTPUT -----
+  if (now - prevDoorSerial >= doorSerialInterval) {
+    prevDoorSerial = now;
+    Serial.print("[Door] ");
+    Serial.println(doorState == HIGH ? "Open" : "Closed");
+  }
+
+  if (now - prevBMESerial >= bmeSerialInterval) {
+    prevBMESerial = now;
+    if (isnan(bme.readTemperature())) {
+      Serial.println("[BME] Sensor read error!");
+      hasError = true;
+    } else {
+      Serial.print("[Temp] "); Serial.print(bme.readTemperature(), 1);
+      Serial.print(" °C\t[Humidity] "); Serial.print(bme.readHumidity(), 1);
+      Serial.print(" %\t[Pressure] ");
+      Serial.print(bme.readPressure() / 100.0F, 1);
+      Serial.println(" hPa");
+    }
+  }
+
+  if (now - prevGPSSerial >= gpsSerialInterval) {
+    prevGPSSerial = now;
+    if (gps.location.isValid()) {
+      Serial.print("[GPS] Lat: "); Serial.print(gps.location.lat(), 6);
+      Serial.print(" Lon: "); Serial.println(gps.location.lng(), 6);
+    } else {
+      Serial.println("[GPS] No Signal");
+      hasError = true;
+    }
+  }
+
+  // ----- ICON REFRESH -----
+  if (now - prevIcon >= iconRefreshInterval) {
+    prevIcon = now;
+    checkConnections();
+  }
+}
+
+// ------------------ Functions ------------------
+void displayGPS() {
+  lcd.setCursor(0, 0);
+  lcd.print("GPS Lat: ");
+  lcd.print(gps.location.isValid() ? gps.location.lat() : NAN, 6);
+
+  lcd.setCursor(0, 1);
+  lcd.print("GPS Lon: ");
+  lcd.print(gps.location.isValid() ? gps.location.lng() : NAN, 6);
+
+  lcd.setCursor(0, 2);
+  lcd.print("Speed: ");
+  lcd.print(gps.speed.isValid() ? gps.speed.kmph() : NAN);
+  lcd.print(" km/h");
+
+  lcd.setCursor(0, 3);
+  lcd.print("Sat: ");
+  lcd.print(gps.satellites.isValid() ? gps.satellites.value() : 0);
+}
+
+void displayBME() {
+  lcd.setCursor(0, 0);
+  lcd.print("Nhiet: ");
+  float t = bme.readTemperature();
+  lcd.print(isnan(t) ? NAN : t, 1);
+  lcd.print((char)223); lcd.print("C");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Do am: ");
+  float h = bme.readHumidity();
+  lcd.print(isnan(h) ? NAN : h, 1);
+  lcd.print("%");
+
+  lcd.setCursor(0, 2);
+  lcd.print("Anh sang: ");
+  int light = analogRead(LIGHT_SENSOR);
+  lcd.print(light);
+
+  lcd.setCursor(0, 3);
+  lcd.print("Cua: ");
+  lcd.print(doorState == HIGH ? "Mo " : "Dong");
+
+}
+
+void displayIcons() {
+  lcd.setCursor(18, 0); lcd.write(byte(0)); // Database
+  lcd.setCursor(18, 1); lcd.write(byte(1)); // Heat warning
+  lcd.setCursor(18, 2); lcd.write(byte(2)); // Buzz
+  lcd.setCursor(18, 3); lcd.write(byte(3)); // Light
+  if(doorState == HIGH){
+    lcd.setCursor(19, 0); lcd.print("!");
+  } 
+  else {
+    lcd.setCursor(19, 0); lcd.write(byte(4)); // Door
+  }
+  if (!WiFi.status() == WL_CONNECTED) {
+    lcd.setCursor(19, 1); lcd.print("?");
+  } 
+  else {
+    lcd.setCursor(19, 1); lcd.write(byte(5)); // Wifi
+  }
+  lcd.setCursor(19, 2); lcd.write(byte(6)); // Humidity
+  lcd.setCursor(19, 3); lcd.write(byte(7)); // Human
+}
+
+void checkConnections() {
+  // Check WiFi and sensors, adjust refresh speed and icons
+  if (WiFi.status() != WL_CONNECTED) {
+    Wifi_stat = false;
+    Serial.println("[WiFi] Lost connection!");
+    lcd.setCursor(19, 1); 
+    lcd.print("!");
+    hasError = true;
+  } else {
+    Wifi_stat = true;
+  }
+
+  if (!gps.location.isValid()) {
+    Serial.println("[GPS] Signal lost!");
+    hasError = true;
+  }
+
+  if (isnan(bme.readTemperature())) {
+    Serial.println("[BME] Sensor disconnected!");
+    hasError = true;
+  }
+}
