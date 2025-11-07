@@ -1,76 +1,139 @@
-// -------------------- Library ------------------------
+
+
+/* ESP32 Cargo Monitor — unified version
+  - Icons update on monitor refresh (every lcdRefreshInterval)
+  - Icons have two warning states each: WARN_A -> '!' flicker, WARN_B -> '?' flicker
+  - Remote config (webapp) controls buzzer conditions and Teamspeak webhook
+  - Serial monitor slows when any error appears; LCD stays at nominal rate
+  - All sensors included: GPS(Serial2), BME280, Light (ADC), HC_SENSOR (PIR), DOOR, SWITCH, Speaker */
+
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <TinyGPS++.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 
-// ------------------ Pin Definitions ------------------
-#define SPEAKER_PIN 23
-#define I2C_SCL 22
-#define I2C_SDA 21
-#define LIGHT_SENSOR 35
-#define HC_SENSOR 33
-#define DOOR_SENSOR 26
-#define SWITCH_PIN 27 
-#define GPS_BAUD 9600
-#define GPS_RX 16
-#define GPS_TX 17
+// ---------- Pinout ----------
+#define SPEAKER_PIN        23
+#define I2C_SCL            22
+#define I2C_SDA            21
+#define LIGHT_SENSOR       35  
+#define HC_SENSOR          33  
+#define DOOR_SENSOR        26   
+#define SWITCH_PIN         27   
 
-// ------------------ Timing Config ------------------
-unsigned long lcdRefreshInterval = 500;
-const unsigned long pageSwitchInterval = 1500;
-const unsigned long iconRefreshInterval = 500;
-const unsigned long doorSerialInterval = 250;
-const unsigned long bmeSerialInterval = 500;
-const unsigned long gpsSerialInterval = 500;
+// ---------- GPS Serial (Hardware Serial 2) ----------
+#define GPS_BAUD           9600
+#define GPS_RX_PIN         16
+#define GPS_TX_PIN         17
+HardwareSerial GPSSerial(2);
 
-// ------------------ WiFi Config ------------------
-const char* ssid = "BKSTAR_T2_02";
-const char* password = "stemstar";
-
-// ------------------ Objects ------------------
+// ---------- LCD / BME / GPS ----------
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 Adafruit_BME280 bme;
 TinyGPSPlus gps;
-HardwareSerial gpsSerial(2);
 
-// ------------------ State Variables ------------------
-bool Wifi_stat = false;
-bool doorState = false;
-bool hasError = false;
-int lcdPage = 0;
+// ---------- WiFi / Remote config ----------
+const char* ssid = "BKSTAR_T2_02";
+const char* password = "stemstar";
 
+const char* configURL = "http://your-server.local/api/device_config"; 
+const char* teamspeakWebhookURL = "http://your-server.local/api/teamspeak_event"; 
+
+// ----------Assign timing (ms) ----------
+unsigned long lcdRefreshInterval = 500;      
+const unsigned long pageSwitchInterval = 1500;
+const unsigned long iconRefreshInterval = 5000; 
+const unsigned long iconFlickerInterval = 250; 
+
+// Serial output intervals (normal / slowed-on-error)
+unsigned long serialDoorIntervalNormal = 250;
+unsigned long serialBMEIntervalNormal  = 500;
+unsigned long serialGPSIntervalNormal  = 500;
+unsigned long serialDoorInterval = serialDoorIntervalNormal;
+unsigned long serialBMEInterval  = serialBMEIntervalNormal;
+unsigned long serialGPSInterval  = serialGPSIntervalNormal;
+const float serialSlowMultiplier = 3.0; 
+
+// ---------- Program state ----------
 unsigned long prevLCD = 0;
 unsigned long prevPage = 0;
-unsigned long prevIcon = 0;
-unsigned long prevDoorSerial = 0;
-unsigned long prevBMESerial = 0;
-unsigned long prevGPSSerial = 0;
+unsigned long prevIconConfig = 0;
+unsigned long prevSerialDoor = 0;
+unsigned long prevSerialBME = 0;
+unsigned long prevSerialGPS = 0;
+unsigned long prevFlicker = 0;
 
-// ------------------ Custom Icons ------------------
-byte iconDB[8]       = {B11000,B10100,B10100,B11010,B00101,B00110,B00101,B00110}; // database
-byte iconHeat[8]     = {B00000,B00100,B00100,B01010,B01010,B10001,B01110,B00000};
-byte iconBuzz[8]     = {B00100,B01010,B01010,B10001,B10001,B01010,B00100,B00000};
-byte iconLight[8]    = {B00100,B01010,B10001,B10001,B01010,B00100,B00000,B00000};
+int lcdPage = 0;
+
+bool wifiConnected = false;
+
+// ---------- Icons (we have 8 custom char slots 0..7 on basic HD44780-like modules) ----------
+byte iconDB[8]       = {B00100,B00100,B01110,B11111,B01110,B00100,B00100,B00000}; // generic
+byte iconHeat[8]     = {B00100,B01110,B01110,B11111,B11111,B01110,B01110,B00100};
+byte iconBuzz[8]     = { B01110, B10001, B00000, B01110, B00000, B11111, B01110, B00100 };
+byte iconLight[8]    = {B00100, B00100, B01110, B11111, B01110, B00100, B00100, B00000};
 byte iconDoor[8]     = {B00000,B11111,B10101,B11111,B10101,B11111,B11111,B11111};
 byte iconWifi[8]     = {B00000,B00000,B00000,B11100,B00010,B11001,B00101,B10101};
 byte iconHumidity[8] = {B01000,B10100,B10100,B01010,B00101,B00001,B00010,B00111};
 byte iconHuman[8]    = {B00100,B01110,B00101,B00111,B01100,B10110,B00101,B01001};
 
-// ------------------ Setup ------------------
+// ---------- Icon manager ----------
+enum IconID { ICON_WIFI=0, ICON_HEAT, ICON_HUMIDITY, ICON_LIGHT, ICON_DOOR, ICON_GPS, ICON_PIR, ICON_BUZZER, ICON_COUNT };
+enum IconState { ICON_OK=0, ICON_WARN_A, ICON_WARN_B, ICON_LOST };
+
+// per-icon structure
+struct Icon {
+  IconState state;
+  bool visibleOriginal;   // toggles during flicker to show original icon or marker (!/?)
+  unsigned long lastToggle;
+};
+
+Icon icons[ICON_COUNT];
+
+// ---------- Remote-config-controlled behaviors ----------
+struct Config {
+  // thresholds only (no remote buzzer toggles)
+  float temp_warn = 40.0;
+  float temp_crit = 60.0;
+  float humidity_warn = 70.0;
+  float humidity_crit = 90.0;
+  int light_warn = 2000;
+  // teamspeak webhook (one-way send)
+  String teamspeakWebhook = String(teamspeakWebhookURL);
+  // keep poll ms as a placeholder (no polling used)
+  unsigned long configPollMs = iconRefreshInterval;
+} cfg;
+
+// ---------- Helper prototypes ----------
+void initIcons();
+void updateSensorsAndIconStates();
+void drawIconsToLCD();
+void sendTeamspeakEvent(const char* eventType, const String &payload);
+void maybeBuzzerAction();
+
+// ---------- Setup ----------
 void setup() {
   Serial.begin(115200);
-  gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX, GPS_TX);
-  Wire.begin(I2C_SDA, I2C_SCL);
+  delay(100);
+
+  // GPS serial
+  GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
+  // I/O
   pinMode(DOOR_SENSOR, INPUT_PULLUP);
-  pinMode(LIGHT_SENSOR, INPUT);
+  pinMode(HC_SENSOR, INPUT);
+  pinMode(SWITCH_PIN, INPUT_PULLUP);
   pinMode(SPEAKER_PIN, OUTPUT);
-  digitalWrite(SPEAKER_PIN,1);
+
+  // I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // LCD
   lcd.init();
   lcd.backlight();
-
   lcd.createChar(0, iconDB);
   lcd.createChar(1, iconHeat);
   lcd.createChar(2, iconBuzz);
@@ -79,191 +142,347 @@ void setup() {
   lcd.createChar(5, iconWifi);
   lcd.createChar(6, iconHumidity);
   lcd.createChar(7, iconHuman);
- 
-  lcd.setCursor(0, 1);
-  lcd.print("Connecting WiFi...");
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Booting...");
+  lcd.setCursor(0,1);
+  lcd.print("WiFi Connecting");
+
+  // WiFi (blocking for some seconds)
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
+  unsigned long start = millis();
+  while ((millis() - start) < 10000) {
+    if (WiFi.status() == WL_CONNECTED) break;
     Serial.print(".");
     lcd.print(".");
     delay(500);
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi connected");
-    Wifi_stat = true;
+    wifiConnected = true;
+    Serial.println("\n[WiFi] Connected");
+    lcd.clear();
+    lcd.print("WiFi OK");
   } else {
-    Serial.println("\nWiFi connection failed");
-    Wifi_stat = false;
-    hasError = true;
+    wifiConnected = false;
+    Serial.println("\n[WiFi] FAILED");
   }
 
-  // tone(SPEAKER_PIN,0,0);
+  // BME init
   if (!bme.begin(0x76)) {
-    Serial.println("Error: BME280 not found!");
-    lcd.clear();
-    lcd.setCursor(0, 1);
-    lcd.print("BME280 error!");
-    digitalWrite(SPEAKER_PIN,0);
-    hasError = true;
+    Serial.println("[BME] ERROR: not found");
+  } else {
+    Serial.println("[BME] OK");
   }
+
+  // initial icon states
+  initIcons();
+
 
   delay(1000);
   lcd.clear();
 }
 
-// ------------------ Loop ------------------
+// ---------- Main loop ----------
 void loop() {
   unsigned long now = millis();
-  doorState = digitalRead(DOOR_SENSOR);
-  while (gpsSerial.available() > 0) gps.encode(gpsSerial.read());
 
-  // Slow down refresh if error occurred
-  unsigned long lcdRate = hasError ? lcdRefreshInterval : lcdRefreshInterval;
-
-  // ----- LCD UPDATE -----
-  if (now - prevLCD >= lcdRate) {
-    prevLCD = now;
-    lcd.clear();
-
-    if (lcdPage == 0) displayGPS();
-    else displayBME();
-
-    displayIcons();
+  // always read GPS bytes into parser (non-blocking)
+  while (GPSSerial.available() > 0) {
+    gps.encode(GPSSerial.read());
   }
 
-  // ----- PAGE SWITCH -----
+  // update sensors + icons at lcdRefreshInterval (icons update with monitor)
+  if (now - prevLCD >= lcdRefreshInterval) {
+    prevLCD = now;
+    // read sensors & decide icon states
+    updateSensorsAndIconStates();
+
+    // draw page content (GPS or BME)
+    lcd.clear();
+    if (lcdPage == 0) {
+      // GPS page
+      lcd.setCursor(0,0);
+      lcd.print("GPS Lat: ");
+      if (gps.location.isValid()) lcd.print(gps.location.lat(), 6); else lcd.print("NaN");
+      lcd.setCursor(0,1);
+      lcd.print("GPS Lon: ");
+      if (gps.location.isValid()) lcd.print(gps.location.lng(), 6); else lcd.print("NaN");
+      lcd.setCursor(0,2);
+      lcd.print("Speed: ");
+      if (gps.speed.isValid()) lcd.print(gps.speed.kmph()); else lcd.print("NaN");
+      lcd.print(" km/h");
+      lcd.setCursor(0,3);
+      lcd.print("Sat: ");
+      if (gps.satellites.isValid()) lcd.print(gps.satellites.value()); else lcd.print("0");
+    } else {
+      // BME + misc
+      lcd.setCursor(0,0);
+      lcd.print("Nhiet: ");
+      float t = bme.readTemperature();
+      if (!isnan(t)) { lcd.print(t, 1); lcd.print((char)223); lcd.print("C"); }
+      else lcd.print("NaN");
+      lcd.setCursor(0,1);
+      lcd.print("Do am: ");
+      float h = bme.readHumidity();
+      if (!isnan(h)) { lcd.print(h, 1); lcd.print("%"); } else lcd.print("NaN");
+      lcd.setCursor(0,2);
+      lcd.print("Anh sang: ");
+      int lux = analogRead(LIGHT_SENSOR);
+      lcd.print(lux);
+      lcd.setCursor(0,3);
+      bool door = digitalRead(DOOR_SENSOR);
+      lcd.print("Cua: ");
+      lcd.print(door == HIGH ? "Mo " : "Dong");
+    }
+
+    // icons (always same columns 18 & 19)
+    drawIconsToLCD();
+  }
+
+  // page switch independent (every pageSwitchInterval)
   if (now - prevPage >= pageSwitchInterval) {
     prevPage = now;
     lcdPage = (lcdPage + 1) % 2;
   }
 
-  // ----- SERIAL OUTPUT -----
-  if (now - prevDoorSerial >= doorSerialInterval) {
-    prevDoorSerial = now;
-    Serial.print("[Door] ");
-    Serial.println(doorState == HIGH ? "Open" : "Closed");
-  }
+  // icon config poll (every cfg.configPollMs)
 
-  if (now - prevBMESerial >= bmeSerialInterval) {
-    prevBMESerial = now;
-    if (isnan(bme.readTemperature())) {
-      Serial.println("[BME] Sensor read error!");
-      hasError = true;
-    } else {
-      Serial.print("[Temp] "); Serial.print(bme.readTemperature(), 1);
-      Serial.print(" °C\t[Humidity] "); Serial.print(bme.readHumidity(), 1);
-      Serial.print(" %\t[Pressure] ");
-      Serial.print(bme.readPressure() / 100.0F, 1);
-      Serial.println(" hPa");
+  // flicker toggle for icons (so !/? alternates with original icon)
+  if (now - prevFlicker >= iconFlickerInterval) {
+    prevFlicker = now;
+    for (int i=0;i<ICON_COUNT;i++) {
+      icons[i].visibleOriginal = !icons[i].visibleOriginal;
     }
   }
 
-  if (now - prevGPSSerial >= gpsSerialInterval) {
-    prevGPSSerial = now;
+
+  unsigned long cur = millis();
+  // Door serial
+  if (cur - prevSerialDoor >= serialDoorInterval) {
+    prevSerialDoor = cur;
+    bool door = digitalRead(DOOR_SENSOR);
+    Serial.print("[Door] ");
+    Serial.println(door == HIGH ? "Open" : "Closed");
+  }
+
+  // BME serial
+  if (cur - prevSerialBME >= serialBMEInterval) {
+    prevSerialBME = cur;
+    float t = bme.readTemperature();
+    float h = bme.readHumidity();
+    float p = bme.readPressure() / 100.0F;
+    if (isnan(t) || isnan(h)) {
+      Serial.println("[BME] Read error / NaN");
+    } else {
+      Serial.print("[BME] ");
+      Serial.print(t,1); Serial.print("C ");
+      Serial.print(h,1); Serial.print("% ");
+      Serial.print(p,1); Serial.println("hPa");
+    }
+  }
+
+  // GPS serial
+  if (cur - prevSerialGPS >= serialGPSInterval) {
+    prevSerialGPS = cur;
     if (gps.location.isValid()) {
-      Serial.print("[GPS] Lat: "); Serial.print(gps.location.lat(), 6);
-      Serial.print(" Lon: "); Serial.println(gps.location.lng(), 6);
+      Serial.print("[GPS] Lat: "); Serial.print(gps.location.lat(),6);
+      Serial.print(" Lon: "); Serial.println(gps.location.lng(),6);
     } else {
       Serial.println("[GPS] No Signal");
-      hasError = true;
+      Serial.println("[ERR] GPS: no signal");
     }
   }
+  // periodic Teamspeak event when buzzer triggers or critical error (example)
+  maybeBuzzerAction();
+}
 
-  // ----- ICON REFRESH -----
-  if (now - prevIcon >= iconRefreshInterval) {
-    prevIcon = now;
-    checkConnections();
+// ---------- Icon and sensor logic ----------
+void initIcons() {
+  for (int i=0;i<ICON_COUNT;i++) {
+    icons[i].state = ICON_OK;
+    icons[i].visibleOriginal = true;
+    icons[i].lastToggle = 0;
   }
 }
 
-// ------------------ Functions ------------------
-void displayGPS() {
-  lcd.setCursor(0, 0);
-  lcd.print("GPS Lat: ");
-  lcd.print(gps.location.isValid() ? gps.location.lat() : NAN, 6);
+// Update sensors, set icon states.
+// This function contains the logic that maps current sensor values to icon states.
+// Two error conditions per icon: WARN_A and WARN_B. For instance: WARN_A = warning, WARN_B = critical.
+void updateSensorsAndIconStates() {
+  // default: OK
+  for (int i=0;i<ICON_COUNT;i++) icons[i].state = ICON_OK;
 
-  lcd.setCursor(0, 1);
-  lcd.print("GPS Lon: ");
-  lcd.print(gps.location.isValid() ? gps.location.lng() : NAN, 6);
+  // WiFi
+  if (WiFi.status() != WL_CONNECTED) icons[ICON_WIFI].state = ICON_WARN_A; // minor: lost wifi
+  else icons[ICON_WIFI].state = ICON_OK;
 
-  lcd.setCursor(0, 2);
-  lcd.print("Speed: ");
-  lcd.print(gps.speed.isValid() ? gps.speed.kmph() : NAN);
-  lcd.print(" km/h");
-
-  lcd.setCursor(0, 3);
-  lcd.print("Sat: ");
-  lcd.print(gps.satellites.isValid() ? gps.satellites.value() : 0);
-}
-
-void displayBME() {
-  lcd.setCursor(0, 0);
-  lcd.print("Nhiet: ");
+  // Temperature from BME
   float t = bme.readTemperature();
-  lcd.print(isnan(t) ? NAN : t, 1);
-  lcd.print((char)223); lcd.print("C");
-
-  lcd.setCursor(0, 1);
-  lcd.print("Do am: ");
-  float h = bme.readHumidity();
-  lcd.print(isnan(h) ? NAN : h, 1);
-  lcd.print("%");
-
-  lcd.setCursor(0, 2);
-  lcd.print("Anh sang: ");
-  int light = analogRead(LIGHT_SENSOR);
-  lcd.print(light);
-
-  lcd.setCursor(0, 3);
-  lcd.print("Cua: ");
-  lcd.print(doorState == HIGH ? "Mo " : "Dong");
-
-}
-
-void displayIcons() {
-  lcd.setCursor(18, 0); lcd.write(byte(0)); // Database
-  lcd.setCursor(18, 1); lcd.write(byte(1)); // Heat warning
-  lcd.setCursor(18, 2); lcd.write(byte(2)); // Buzz
-  lcd.setCursor(18, 3); lcd.write(byte(3)); // Light
-  if(doorState == HIGH){
-    lcd.setCursor(19, 0); lcd.print("!");
-  } 
-  else {
-    lcd.setCursor(19, 0); lcd.write(byte(4)); // Door
-  }
-  if (!WiFi.status() == WL_CONNECTED) {
-    lcd.setCursor(19, 1); lcd.print("?");
-  } 
-  else {
-    lcd.setCursor(19, 1); lcd.write(byte(5)); // Wifi
-  }
-  lcd.setCursor(19, 2); lcd.write(byte(6)); // Humidity
-  lcd.setCursor(19, 3); lcd.write(byte(7)); // Human
-}
-
-void checkConnections() {
-  // Check WiFi and sensors, adjust refresh speed and icons
-  if (WiFi.status() != WL_CONNECTED) {
-    Wifi_stat = false;
-    Serial.println("[WiFi] Lost connection!");
-    lcd.setCursor(19, 1); 
-    lcd.print("!");
-    hasError = true;
+  if (isnan(t)) {
+    icons[ICON_HEAT].state = ICON_WARN_B; // lost sensor = critical
+    Serial.println("[ERR] BME: temp NaN");
   } else {
-    Wifi_stat = true;
+    if (t >= cfg.temp_crit) icons[ICON_HEAT].state = ICON_WARN_B;
+    else if (t >= cfg.temp_warn) icons[ICON_HEAT].state = ICON_WARN_A;
   }
 
-  if (!gps.location.isValid()) {
-    Serial.println("[GPS] Signal lost!");
-    hasError = true;
+  // Humidity
+  float h = bme.readHumidity();
+  if (isnan(h)) {
+    icons[ICON_HUMIDITY].state = ICON_WARN_B;
+  } else {
+    if (h >= cfg.humidity_crit) icons[ICON_HUMIDITY].state = ICON_WARN_B;
+    else if (h >= cfg.humidity_warn) icons[ICON_HUMIDITY].state = ICON_WARN_A;
   }
 
-  if (isnan(bme.readTemperature())) {
-    Serial.println("[BME] Sensor disconnected!");
-    hasError = true;
+  // Light
+  int lux = analogRead(LIGHT_SENSOR);
+  if (lux <= 0) {
+    // suspicious ADC reading
+    icons[ICON_LIGHT].state = ICON_WARN_B;
+    Serial.println("[ERR] LIGHT: ADC zero?");
+  } else {
+    if (lux >= cfg.light_warn) icons[ICON_LIGHT].state = ICON_WARN_A;
+  }
+
+  // Door
+  bool door = digitalRead(DOOR_SENSOR);
+  if (!door) {
+    // if door closed = normally okay; if open when shouldn't, handled by remote config in future
+  }
+  // For example: do warn if door is open
+  if (door == HIGH) {
+    icons[ICON_DOOR].state = ICON_WARN_A; // door open
+  } else {
+    icons[ICON_DOOR].state = ICON_OK;
+  }
+
+  // GPS
+  if (!gps.location.isValid()) icons[ICON_GPS].state = ICON_WARN_A;
+  else icons[ICON_GPS].state = ICON_OK;
+
+  // PIR HC_SENSOR
+  bool pir = digitalRead(HC_SENSOR);
+  if (pir) icons[ICON_PIR].state = ICON_WARN_A;
+
+  // Buzzer icon: driven by whether buzzer is currently active (we will set ICON_WARN_A)
+  // For now leave OK; buzzer action will also set icon if triggered.
+
+  // When any WARN_B exists, mark global error
+  bool foundCritical = false;
+}
+
+// Draw icons to LCD: icons occupy columns 18 and 19 across four rows.
+// We map sets of icons to each row. Adjust mapping to taste.
+void drawIconsToLCD() {
+  // mapping (example): row0: wifi / gps, row1: heat / human, row2: humidity / light, row3: door / buzzer
+  // each icon displays either original custom char (0..7) or '!' / '?' depending on state and flicker.
+  struct { IconID left; IconID right; uint8_t leftChar; uint8_t rightChar; } layout[] = {
+    { ICON_WIFI, ICON_GPS, 5, 6 },     // row 0 (wifi icon -> custom 5, gps -> custom 6 (humidity placeholder))
+    { ICON_HEAT, ICON_PIR, 1, 7 },     // row 1
+    { ICON_HUMIDITY, ICON_LIGHT, 6, 3},// row 2
+    { ICON_DOOR, ICON_BUZZER, 4, 2 }   // row 3
+  };
+
+  for (int row=0; row<4; row++) {
+    int colLeft = 18;
+    int colRight = 19;
+    // left icon
+    Icon &icL = icons[ layout[row].left ];
+    lcd.setCursor(colLeft, row);
+    if (icL.state == ICON_OK) {
+      lcd.write(byte(layout[row].leftChar));
+    } else if (icL.state == ICON_WARN_A) {
+      // flicker between original and '!'
+      if (icL.visibleOriginal) lcd.write(byte(layout[row].leftChar));
+      else lcd.print("!");
+    } else if (icL.state == ICON_WARN_B) {
+      if (icL.visibleOriginal) lcd.write(byte(layout[row].leftChar));
+      else lcd.print("?");
+    } else { // LOST or other
+      lcd.print("!");
+    }
+
+    // right icon
+    Icon &icR = icons[ layout[row].right ];
+    lcd.setCursor(colRight, row);
+    if (icR.state == ICON_OK) {
+      lcd.write(byte(layout[row].rightChar));
+    } else if (icR.state == ICON_WARN_A) {
+      if (icR.visibleOriginal) lcd.write(byte(layout[row].rightChar));
+      else lcd.print("!");
+    } else if (icR.state == ICON_WARN_B) {
+      if (icR.visibleOriginal) lcd.write(byte(layout[row].rightChar));
+      else lcd.print("?");
+    } else {
+      lcd.print("!");
+    }
   }
 }
+
+// ---------- Remote config (GET JSON) ----------
+
+
+// ---------- Teamspeak / webhook POST ----------
+void sendTeamspeakEvent(const char* eventType, const String &payload) {
+  // Minimal POST wrapper. Your middleware should accept this and translate to Teamspeak ServerQuery or plugin.
+  if (!wifiConnected) { Serial.println("[TS] skip send, no wifi"); return; }
+  HTTPClient http;
+  http.begin(cfg.teamspeakWebhook);
+  http.addHeader("Content-Type", "application/json");
+  StaticJsonDocument<256> doc;
+  doc["event"] = eventType;
+  doc["payload"] = payload;
+  String out;
+  serializeJson(doc, out);
+  int code = http.POST(out);
+  if (code > 0) {
+    Serial.print("[TS] sent code=");
+    Serial.println(code);
+  } else {
+    Serial.print("[TS] send fail: ");
+    Serial.println(http.errorToString(code));
+  }
+  http.end();
+}
+
+// ---------- Buzzer / Teamspeak action logic ----------
+unsigned long lastBuzzerEvent = 0;
+const unsigned long buzzerMinInterval = 5000; // avoid spamming
+
+void maybeBuzzerAction() {
+  // Decide if buzzer should sound based on hard-coded thresholds in cfg
+  bool shouldBuzz = false;
+  float t = bme.readTemperature();
+  float h = bme.readHumidity();
+  bool doorOpen = digitalRead(DOOR_SENSOR) == HIGH;
+  bool pir = digitalRead(HC_SENSOR) == HIGH;
+
+  if (!isnan(t) && t >= cfg.temp_warn) shouldBuzz = true;
+  if (!isnan(h) && h >= cfg.humidity_warn) shouldBuzz = true;
+  if (doorOpen) shouldBuzz = true;
+  if (pir) shouldBuzz = true;
+
+  if (shouldBuzz && (millis() - lastBuzzerEvent) > buzzerMinInterval) {
+    // beep
+    tone(SPEAKER_PIN, 2000, 200);
+    lastBuzzerEvent = millis();
+    // set buzzer icon state briefly
+    icons[ICON_BUZZER].state = ICON_WARN_A;
+    icons[ICON_BUZZER].visibleOriginal = false;
+
+    // notify Teamspeak webhook (one-way)
+    StaticJsonDocument<128> doc;
+    String pl;
+    doc["temp"] = isnan(t) ? -999.0 : t;
+    doc["humidity"] = isnan(h) ? -999.0 : h;
+    doc["door"] = doorOpen;
+    doc["pir"] = pir;
+    serializeJson(doc, pl);
+    sendTeamspeakEvent("buzzer_trigger", pl);
+  }
+}
+
