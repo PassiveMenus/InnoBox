@@ -1,5 +1,5 @@
-
-
+## 07.11.25
+# Updating the code (last updated: 17.10.25
 /* ESP32 Cargo Monitor — unified version
   - Icons update on monitor refresh (every lcdRefreshInterval)
   - Icons have two warning states each: WARN_A -> '!' flicker, WARN_B -> '?' flicker
